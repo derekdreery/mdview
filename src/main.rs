@@ -14,29 +14,28 @@
 
 //! An example of live markdown preview
 
+mod md;
+
 use std::fs;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
 use druid::commands::{COPY, CUT, NEW_FILE, OPEN_FILE, PASTE, SAVE_FILE, SAVE_FILE_AS};
-use pulldown_cmark::{CodeBlockKind, Event as ParseEvent, Parser, Tag};
 
-use druid::text::{
-    AttributesAdder, EditableText, RichText, RichTextBuilder, Selection, TextStorage,
-};
+use druid::text::{EditableText, Selection, TextStorage};
 use druid::widget::prelude::*;
-use druid::widget::{Controller, LineBreaking, RawLabel, Scroll, Split, TextBox};
+use druid::widget::{Controller, Split, TextBox};
 use druid::{
-    AppDelegate, AppLauncher, Application, ArcStr, Color, Command, Data, DelegateCtx,
-    FontDescriptor, FontFamily, FontStyle, FontWeight, Handled, Lens, LocalizedString, Menu,
-    Selector, Target, Widget, WidgetExt, WindowDesc, WindowId,
+    AppDelegate, AppLauncher, Application, Color, Command, Data, DelegateCtx, FontDescriptor,
+    FontFamily, Handled, Lens, LocalizedString, Menu, Selector, Target, Widget, WidgetExt,
+    WindowDesc, WindowId,
 };
 use once_cell::sync::Lazy as SyncLazy;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Highlighter, Style, Theme, ThemeSet};
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
-use syntect::util::LinesWithEndings;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+
+use crate::md::Markdown;
 
 const WINDOW_TITLE: LocalizedString<AppState> = LocalizedString::new("Minimal Markdown");
 
@@ -55,7 +54,6 @@ struct AppState {
     /// `None` represents a buffer without an associated file.
     open_file: Option<Arc<Path>>,
     raw: Arc<String>,
-    rendered: RichText,
     #[data(eq)]
     selection: Selection,
 }
@@ -71,25 +69,6 @@ impl AppState {
 }
 
 /// A controller that rebuilds the preview when edits occur
-struct RichTextRebuilder;
-
-impl<W: Widget<AppState>> Controller<AppState, W> for RichTextRebuilder {
-    fn event(
-        &mut self,
-        child: &mut W,
-        ctx: &mut EventCtx,
-        event: &Event,
-        data: &mut AppState,
-        env: &Env,
-    ) {
-        let pre_data = data.raw.clone();
-        child.event(ctx, event, data, env);
-        if !data.raw.same(&pre_data) {
-            data.rendered = rebuild_rendered_text(&data.raw);
-        }
-    }
-}
-
 #[derive(Default)]
 struct SelectionNotifier {
     selection: Selection,
@@ -161,7 +140,6 @@ impl AppDelegate<AppState> for Delegate {
         } else if cmd.get(NEW_FILE).is_some() {
             data.open_file = None;
             data.raw = "".to_string().into();
-            data.rendered = rebuild_rendered_text(&data.raw);
             Handled::Yes
         } else if let Some(finfo) = cmd.get(OPEN_FILE) {
             let file_contents = match fs::read_to_string(finfo.path()) {
@@ -173,7 +151,6 @@ impl AppDelegate<AppState> for Delegate {
             };
             data.open_file = Some(finfo.path().to_owned().into());
             data.raw = file_contents.into();
-            data.rendered = rebuild_rendered_text(&data.raw);
             Handled::Yes
         } else if cmd.get(SAVE_FILE).is_some() {
             if let Some(path) = &data.open_file {
@@ -240,7 +217,6 @@ pub fn main() {
     let initial_state = AppState {
         open_file: None,
         raw: "".to_string().into(),
-        rendered: rebuild_rendered_text(""),
         selection: Selection::new(0, 0),
     };
 
@@ -271,6 +247,7 @@ fn log_to_console() {
 }
 
 fn build_root_widget() -> impl Widget<AppState> {
+    /*
     let label = Scroll::new(
         RawLabel::new()
             .with_text_color(Color::BLACK)
@@ -282,6 +259,7 @@ fn build_root_widget() -> impl Widget<AppState> {
     .vertical()
     .background(Color::grey8(222))
     .expand();
+    */
 
     let textbox = TextBox::multiline()
         .with_font(FontDescriptor::new(FontFamily::MONOSPACE).with_size(14.))
@@ -291,172 +269,7 @@ fn build_root_widget() -> impl Widget<AppState> {
         .expand()
         .padding(5.0);
 
-    Split::columns(textbox, label).controller(RichTextRebuilder)
-}
-
-/// Parse a markdown string and generate a `RichText` object with
-/// the appropriate attributes.
-fn rebuild_rendered_text(text: &str) -> RichText {
-    let mut current_pos = 0;
-    let mut builder = RichTextBuilder::new();
-    let mut tag_stack = Vec::new();
-
-    let parser = Parser::new(text);
-    let mut event_iter = parser.into_iter();
-    while let Some(event) = event_iter.next() {
-        match event {
-            ParseEvent::Start(tag) => match &tag {
-                Tag::CodeBlock(code_type) => {
-                    handle_codeblock(&mut builder, &mut event_iter, code_type)
-                }
-                _ => {
-                    tag_stack.push((current_pos, tag));
-                }
-            },
-            ParseEvent::Text(txt) => {
-                builder.push(&txt);
-                current_pos += txt.len();
-            }
-            ParseEvent::End(end_tag) => {
-                let (start_off, tag) = tag_stack
-                    .pop()
-                    .expect("parser does not return unbalanced tags");
-                assert_eq!(end_tag, tag, "mismatched tags?");
-                add_attribute_for_tag(
-                    &tag,
-                    builder.add_attributes_for_range(start_off..current_pos),
-                );
-                if add_newline_after_tag(&tag) {
-                    builder.push("\n\n");
-                    current_pos += 2;
-                }
-            }
-            ParseEvent::Code(txt) => {
-                builder.push(&txt).font_family(FontFamily::MONOSPACE);
-                current_pos += txt.len();
-            }
-            ParseEvent::Html(txt) => {
-                builder
-                    .push(&txt)
-                    .font_family(FontFamily::MONOSPACE)
-                    .text_color(BLOCKQUOTE_COLOR);
-                current_pos += txt.len();
-            }
-            ParseEvent::HardBreak => {
-                builder.push("\n\n");
-                current_pos += 2;
-            }
-            _ => (),
-        }
-    }
-    builder.build()
-}
-
-/// Handle a codeblock, consuming tokens as needed
-fn handle_codeblock(
-    builder: &mut RichTextBuilder,
-    event_iter: &mut Parser,
-    code_type: &CodeBlockKind,
-) {
-    let block_name = match code_type {
-        CodeBlockKind::Indented => "",
-        CodeBlockKind::Fenced(ty) => *&ty,
-    };
-    let text = match event_iter.next().expect("expected text") {
-        ParseEvent::Text(code_text) => code_text,
-        ParseEvent::End(Tag::CodeBlock(_)) => return,
-        evt => {
-            tracing::warn!("unexpected event: {:?}", evt);
-            return;
-        }
-    };
-    let theme = &THEMES.themes["Solarized (dark)"];
-    // Try to guess the type of data
-    let syntax = SYNTAX
-        // like find_syntax_by_name but ignores case
-        .syntaxes()
-        .iter()
-        .find(|syntax| syntax.name.eq_ignore_ascii_case(block_name))
-        .or_else(|| SYNTAX.find_syntax_by_extension(block_name))
-        .or_else(|| SYNTAX.find_syntax_by_first_line(&text))
-        .unwrap_or_else(|| SYNTAX.find_syntax_plain_text());
-    let mut h = HighlightLines::new(syntax, theme);
-    for line in LinesWithEndings::from(&text) {
-        let ranges: Vec<(Style, &str)> = h.highlight(line, &SYNTAX);
-        for (style, subtext) in ranges {
-            apply_styles(builder.push(subtext), style);
-        }
-    }
-    match event_iter.next() {
-        Some(ParseEvent::End(Tag::CodeBlock(_))) => (),
-        evt => tracing::warn!("unexpected token {:?}", evt),
-    }
-}
-
-fn apply_styles(mut adder: AttributesAdder, style: Style) {
-    adder.text_color(syntect_to_druid_color(style.foreground));
-    if style
-        .font_style
-        .contains(syntect::highlighting::FontStyle::BOLD)
-    {
-        adder.weight(FontWeight::BOLD);
-    }
-    if style
-        .font_style
-        .contains(syntect::highlighting::FontStyle::ITALIC)
-    {
-        adder.style(FontStyle::Italic);
-    }
-}
-
-fn syntect_to_druid_color(color: syntect::highlighting::Color) -> Color {
-    Color::rgba8(color.r, color.g, color.b, color.a)
-}
-
-fn add_newline_after_tag(tag: &Tag) -> bool {
-    !matches!(
-        tag,
-        Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link(..)
-    )
-}
-
-fn add_attribute_for_tag(tag: &Tag, mut attrs: AttributesAdder) {
-    match tag {
-        Tag::Heading(lvl) => {
-            let font_size = match lvl {
-                1 => 38.,
-                2 => 32.0,
-                3 => 26.0,
-                4 => 20.0,
-                5 => 16.0,
-                _ => 12.0,
-            };
-            attrs.size(font_size).weight(FontWeight::BOLD);
-        }
-        Tag::BlockQuote => {
-            attrs.style(FontStyle::Italic).text_color(BLOCKQUOTE_COLOR);
-        }
-        Tag::CodeBlock(CodeBlockKind::Indented) => {
-            attrs.font_family(FontFamily::MONOSPACE);
-        }
-        Tag::CodeBlock(CodeBlockKind::Fenced(label)) => {
-            attrs.font_family(FontFamily::MONOSPACE);
-        }
-        Tag::Emphasis => {
-            attrs.style(FontStyle::Italic);
-        }
-        Tag::Strong => {
-            attrs.weight(FontWeight::BOLD);
-        }
-        Tag::Link(_link_ty, target, _title) => {
-            attrs
-                .underline(true)
-                .text_color(LINK_COLOR)
-                .link(OPEN_LINK.with(target.to_string()));
-        }
-        // ignore other tags for now
-        _ => (),
-    }
+    Split::columns(textbox, Markdown::new().padding(10.).lens(AppState::raw))
 }
 
 #[allow(unused_assignments, unused_mut)]
@@ -468,7 +281,6 @@ fn make_menu(_window_id: Option<WindowId>, _data: &AppState, _env: &Env) -> Menu
     }
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
-        //base = base.entry(druid::platform_menus::win::file::default());
         base = base.entry(
             Menu::new(LocalizedString::new("common-menu-file-menu"))
                 .entry(druid::platform_menus::win::file::new())
